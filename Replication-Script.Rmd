@@ -1,0 +1,1221 @@
+---
+title: "Media-Mortality"
+author: "Calvin Isch"
+date: "2024-06-14"
+output: html_document
+---
+
+# Import packages
+```{r}
+library(dplyr); library(DescTools); library(ggplot2); library(ggpubr); library(stringr)
+library(lme4); library(ggrepel); library(lmerTest); library(tidyr); library(sensitivitymv)
+library(broom); library(forecast); library(broom.mixed); library(lubridate);
+library(writexl)
+
+options(scipen = 999)
+
+set.seed(123)
+```
+
+# Table 1
+```{r}
+df <- read.csv('data/time-series-data-2.csv')
+
+df = df %>% mutate(Date = as.Date(Date)) %>% 
+  filter(Date < '2021-01-01' & Date > '1998-12-31') %>% 
+  mutate(Risk = ifelse(Risk == "Heart", "Heart Disease", Risk),
+                    Risk = ifelse(Risk == "Alzheimers", "Alzheimer's", Risk),
+                    Risk = ifelse(Risk == "Terror", "Terrorism", Risk),
+                    Risk = ifelse(Risk == "COVID-19", "Pandemics", Risk))
+
+table_1 <- df %>% group_by(Risk) %>%
+  summarise(Deaths = round(sum(Deaths),0),
+            Media_Mentions = round(sum(media_mentions),0),
+            ratio = round(sum(media_mentions) / sum(Deaths), 5))
+table_1 <- rbind(table_1, c('Overall', sum(table_1$Deaths), 
+                            sum(table_1$Media_Mentions), 
+                            sum(table_1$Media_Mentions) / sum(table_1$Deaths)))
+
+
+table_1 <- table_1 %>% arrange(ratio)
+
+# Terrorism is the only one with more articles than deaths
+terror <- paste0(round(table_1 %>% filter(Risk == 'Terrorism') %>% select(ratio) %>% as.numeric(),0),":1")
+table_1$Ratio_Nice <- paste0('1:', round(1 / as.numeric(table_1$ratio), 0))
+table_1 <- table_1 %>% mutate(Ratio_Nice = ifelse(Risk == "Terrorism",terror,Ratio_Nice))
+
+
+write_xlsx(table_1 %>% select(Risk, Media_Mentions, Deaths, Ratio_Nice), "tables/Table_1.xlsx")
+
+# Remove COVID and Terror from main analysis
+df_weirdos <- df %>% filter(Risk == 'Pandemics' | Risk == 'Terrorism') %>%
+  mutate(Date = as.Date(Date))
+df <- df %>% filter(Risk != 'Pandemics', Risk != 'Terrorism') %>%
+  mutate(Date = as.Date(Date))
+
+```
+
+
+# Figure 1
+```{r}
+df$Year <- as.numeric(format(df$Date, "%Y"))
+df_yearly <- df %>% group_by(Year, Risk) %>% 
+  summarise(Deaths_windsor = sum(Deaths_windsor),
+  media_mentions_windsor = sum(media_mentions_windsor))
+
+# Plot Time series - Leveled
+a <- ggplot(df_yearly, aes(x = Year, group = Risk)) + 
+  geom_line(aes(y = Deaths_windsor, color = "Deaths"), alpha=0.8, linewidth=0.5) +
+  geom_line(aes(y = media_mentions_windsor * 100, color = "Media Mentions"), alpha=0.8, linewidth=0.5) +
+  scale_y_log10(name = "Deaths",
+                sec.axis = sec_axis(~ . / 100, name = "Media Mentions")) +
+  facet_wrap(~Risk, scales = "free_y") +
+  theme_bw() +
+  scale_x_continuous() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(color = "Metric", x = "") +  
+  scale_color_manual(values = c("Deaths" = "black", "Media Mentions" = "blue"))
+
+
+
+df_yearly$Ratio <- df_yearly$media_mentions_windsor / df_yearly$Deaths_windsor
+risk_colors = c("Alzheimer's"='#1f77b4',"Traffic Accidents" = '#ff7f0e', "Cancer"='#2ca02c', "Respiratory Diseases"='#d62728',
+  "Diabetes"='#9467bd', "Overdose"='#8c564b',"Heart Disease"='#e377c2',"Homicide"='#7f7f7f',
+  "Influenza"='#bcbd22',"STDs"='#17becf',"Stroke"='#aec7e8',"Suicide"='#ffbb78',"Terrorism"='#98df8a',
+  "Pandemics"= "gold")
+
+unique(df_yearly$Risk)
+
+b <- ggplot(df_yearly, aes(x = Year, y = Ratio, color=Risk)) +
+  scale_color_manual(values = risk_colors) +
+  geom_line() + scale_y_continuous(breaks = c(1/500, 1/100, 1/10, 1/3), 
+                      labels = c("1:500", "1:100", "1:10", "1:3"), trans='log')+
+  theme_bw() + labs(y="Ratio of Articles to Deaths")
+
+ggarrange(a, b, ncol = 1, nrow = 2, labels = c("A", "B"), heights = c(0.6, 0.4))
+
+ggsave('plots/Deaths-Media-Mentions-Time-Series-Ratio.png',width = 10.5, height=7.875)
+```
+
+# Figure 2
+```{r}
+ggplot(df, aes(x = log_Deaths_windsor, y = log_media_mentions_windsor, color = Risk)) +
+  geom_point(alpha = 0.3,size=0.1) +  # Semi-transparent points to show data density
+  geom_smooth(method = "lm", se = FALSE) +  # Linear model fit line
+  labs(x = "Deaths", y = "Media Mentions") + theme_bw() + 
+  scale_color_manual(values = risk_colors)
+ggsave('plots/Random-Effects-level.png',width = 8, height=5)
+```
+
+# Model 1
+```{r}
+df$FMonth <- factor(format(df$Date, "%m"))
+model_null1 <- lm(log_media_mentions_windsor ~ log_Deaths_windsor + FMonth, data = df)
+model_null <- lmer(log_media_mentions_windsor ~ log_Deaths_windsor + FMonth + (1 | Risk), data = df)
+anova(model_null, model_null1)
+model <- lmer(log_media_mentions_windsor ~ log_Deaths_windsor + FMonth + (log_Deaths_windsor | Risk), data = df)
+
+# Random slopes help (Anova in main text)
+anova(model_null, model)
+ranova(model) # Alternative test
+summary(model)
+
+# Write supplementary table S2
+model_tidy <- tidy(model)
+model_tidy <- model_tidy %>% select(-group) %>%
+  mutate_if(is.numeric, round, 3)
+write.csv(model_tidy, 'tables/TableS2_Model1-Summary.csv', row.names=FALSE)
+
+# Save random effects for subsequent analysis
+re <- ranef(model, condVar = TRUE)
+t <- re$Risk
+t$Risk <- unique(df$Risk)
+t <- t %>% mutate_if(is.numeric, round, 2)
+Slopes <- t %>% select(log_Deaths_windsor, Risk)
+write.csv(t, 'tables/TableS3_Model1-Random-Effects.csv', row.names = FALSE)
+```
+
+
+# Model 2
+```{r}
+model_null <- lmer(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + (1 | Risk), data = df)
+model <- lmer(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + (dd_log_Deaths_windsor | Risk), data = df)
+
+# Anova in main text
+anova(model_null, model)
+
+summary(model)
+model_tidy <- tidy(model)
+model_tidy <- model_tidy %>% select(-group) %>%
+  mutate_if(is.numeric, round, 3)
+write.csv(model_tidy, 'tables/TableS4_Model2-Summary.csv', row.names=FALSE)
+
+re <- ranef(model, condVar = TRUE)
+t <- re$Risk
+t$Risk <- unique(df$Risk)
+t <- t %>% mutate_if(is.numeric, round, 2)
+write.csv(t, 'tables/TableS5_Model2-Random-Effects.csv', row.names = FALSE)
+```
+
+
+# Model 3 - Autoregressive Distributed lag model
+```{r}
+risks <- unique(df$Risk)
+p_values <- c()
+r_square_change <- c()
+df_all_output <- data.frame()
+for (current_risk in risks) {
+  #current_risk <- 'Heart'
+  df_cur <- df %>% filter(Risk == current_risk)
+  
+  # Create dummy term for month to capture seasonality
+  df_cur$FMonth <- factor(format(df_cur$Date, "%m"))
+  
+  # Create lagged variables
+  for (i in 1:3) {
+    df_cur[[paste0("log_Deaths_windsorlag", i)]] <- c(rep(NA, i), 
+                                    df_cur$log_Deaths_windsor[1:(nrow(df_cur) - i)])
+    df_cur[[paste0("log_media_mentions_windsorlag", i)]] <- c(rep(NA, i),
+                              df_cur$log_media_mentions_windsor[1:(nrow(df_cur) - i)])
+  }
+  
+  base_model <- lm(log_media_mentions_windsor ~ log_Deaths_windsor + log_media_mentions_windsorlag1 + log_media_mentions_windsorlag2 + log_media_mentions_windsorlag3 + FMonth, data = df_cur %>% drop_na())
+  model <- lm(log_media_mentions_windsor ~ log_Deaths_windsor + log_Deaths_windsorlag1 + log_Deaths_windsorlag2 + log_Deaths_windsorlag3 + log_media_mentions_windsorlag1 + log_media_mentions_windsorlag2 + log_media_mentions_windsorlag3  + FMonth, data = df_cur %>% drop_na())
+  summary(model)
+  
+  # Does including the lag help?
+  compare <- anova(base_model, model)
+  p_value <- round(compare[2,6],7)
+  p_values <- c(p_values, p_value)
+  
+  
+  # What are the coefficients?
+  coefficients <- summary(model)$coefficients
+  coeff_p_values <- data.frame(
+    Coefficient = coefficients[, "Estimate"],
+    P_Value = coefficients[, "Pr(>|t|)"]
+  )
+  coeff_p_values <- coeff_p_values %>%
+  mutate(
+    Coefficient = round(Coefficient, 2),
+    P_Value = ifelse(P_Value < 0.001, "***",ifelse(P_Value < 0.01, "**", ifelse(P_Value < 0.05, "*", ifelse(P_Value < 0.1, ".", ""))))
+  )
+  coeff_p_values <- coeff_p_values %>% rowwise() %>%
+    mutate(Formatted = paste0(Coefficient, P_Value)) %>%
+    ungroup() %>% select(Formatted)
+  coeff_p_values <- t(head(coeff_p_values, 8))
+  colnames(coeff_p_values) <- c("intercept", "Deaths", "Deaths_lag1", "Deaths_lag2",
+                                "Deaths_lag3", "Media_lag1", "Media_lag2", "Media_lag3")
+  coeff_p_values <- as.data.frame(coeff_p_values)
+  coeff_p_values$Risk <- current_risk
+
+
+  model_summary <- summary(model)
+  f_statistic <- model_summary$fstatistic[1]
+  df1 <- model_summary$fstatistic[2]
+  df2 <- model_summary$fstatistic[3]
+  adjusted_r_squared <- model_summary$adj.r.squared
+  
+  coeff_p_values$Summary <- paste("F=", round(f_statistic,1), ", Adj. R^2 = ", round(adjusted_r_squared,2), "\n", sep = "")
+  
+  df_all_output <- rbind(df_all_output, coeff_p_values)
+  
+  no_death_model <- lm(log_media_mentions_windsor ~ log_media_mentions_windsorlag1 +
+                         log_media_mentions_windsorlag2 + log_media_mentions_windsorlag3 +
+                         FMonth, data = df_cur %>% drop_na())
+  r_square_change <- c(r_square_change, summary(model)$r.squared -
+                         summary(no_death_model)$r.squared)
+  
+}
+
+# Table with summary of all models
+df_all_output <- df_all_output %>% select(Risk, Summary, intercept, Deaths, Deaths_lag1, Deaths_lag2, Deaths_lag3, Media_lag1, Media_lag2, Media_lag3)
+write.csv(df_all_output, 'tables/TableS6_Model3-All-Output.csv', row.names = FALSE)
+
+# Does including lagged help?
+df_table <- data.frame(Risk = risks, P_Value = p_values)
+write.csv(df_table, 'tables/TableS7_Model3-P-Values.csv', row.names = FALSE)
+
+# Combine p-values
+truncatedP(p_values, trunc=1)
+
+# Change in R-squared
+mean(r_square_change)
+```
+
+# Model 3B - Deseasonalized and Differenced
+```{r}
+# All risks
+risks <- unique(df$Risk)
+p_values <- c()
+r_square_change <- c()
+df_all_output <- data.frame()
+# Divergence 2: Just keeping three lags for deaths for ease of reference.
+for (current_risk in risks) {
+  df_cur <- df %>% filter(Risk == current_risk)
+  
+  # Create lagged variables
+  for (i in 1:3) {
+    df_cur[[paste0("dd_log_Deaths_windsorlag", i)]] <- c(rep(NA, i), 
+                                    df_cur$dd_log_Deaths_windsor[1:(nrow(df_cur) - i)])
+    df_cur[[paste0("dd_log_media_mentions_windsorlag", i)]] <- c(rep(NA, i),
+                              df_cur$dd_log_media_mentions_windsor[1:(nrow(df_cur) - i)])
+  }
+  
+  
+  model <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor +
+                dd_log_Deaths_windsorlag1 + dd_log_Deaths_windsorlag2 +
+                dd_log_Deaths_windsorlag3 +
+                dd_log_media_mentions_windsorlag1 + dd_log_media_mentions_windsorlag2 +
+                dd_log_media_mentions_windsorlag3 , data = df_cur %>% drop_na())
+  
+  base_model <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor +
+                     dd_log_media_mentions_windsorlag1 +
+                  dd_log_media_mentions_windsorlag2 + dd_log_media_mentions_windsorlag3,
+                   data = df_cur %>% drop_na())
+  
+  compare <- anova(base_model, model)
+  # Get p-value
+  p_value <- round(compare[2,6],7)
+  p_values <- c(p_values, p_value)
+  
+  # What are the coefficients?
+  coefficients <- summary(model)$coefficients
+  coeff_p_values <- data.frame(
+    Coefficient = coefficients[, "Estimate"],
+    P_Value = coefficients[, "Pr(>|t|)"]
+  )
+  coeff_p_values <- coeff_p_values %>%
+  mutate(
+    Coefficient = round(Coefficient, 2),
+    P_Value = ifelse(P_Value < 0.001, "***",ifelse(P_Value < 0.01, "**", ifelse(P_Value < 0.05, "*", ifelse(P_Value < 0.1, ".", ""))))
+  )
+  coeff_p_values <- coeff_p_values %>% rowwise() %>%
+    mutate(Formatted = paste0(Coefficient, P_Value)) %>%
+    ungroup() %>% select(Formatted)
+  coeff_p_values <- t(head(coeff_p_values, 8))
+  colnames(coeff_p_values) <- c("intercept", "Deaths", "Deaths_lag1", "Deaths_lag2",
+                                "Deaths_lag3", "Media_lag1", "Media_lag2", "Media_lag3")
+  coeff_p_values <- as.data.frame(coeff_p_values)
+  coeff_p_values$Risk <- current_risk
+
+
+  model_summary <- summary(model)
+  f_statistic <- model_summary$fstatistic[1]
+  df1 <- model_summary$fstatistic[2]
+  df2 <- model_summary$fstatistic[3]
+  adjusted_r_squared <- model_summary$adj.r.squared
+  
+  coeff_p_values$Summary <- paste("F=", round(f_statistic,1), ", Adj. R^2 = ", round(adjusted_r_squared,2), "\n", sep = "")
+  
+  df_all_output <- rbind(df_all_output, coeff_p_values)
+  
+  no_death_model <- lm(dd_log_media_mentions_windsor ~ dd_log_media_mentions_windsorlag1 +
+                  dd_log_media_mentions_windsorlag2 + dd_log_media_mentions_windsorlag3,
+                   data = df_cur %>% drop_na())
+  r_square_change <- c(r_square_change, summary(model)$r.squared -
+                         summary(no_death_model)$r.squared)
+  
+}
+
+# Table with summary of all models
+df_all_output <- df_all_output %>% select(Risk, Summary, intercept, Deaths, Deaths_lag1, Deaths_lag2, Deaths_lag3, Media_lag1, Media_lag2, Media_lag3)
+write.csv(df_all_output, 'tables/TableS8_Model4-All-Output.csv', row.names = FALSE)
+
+df_table <- data.frame(Risk = risks, P_Value = p_values)
+write.csv(df_table, 'tables/TableS9_Model4-P-Values.csv', row.names = FALSE)
+
+# Joint significance
+truncatedP(p_values, trunc=1)
+
+# R-squared change
+mean(r_square_change)
+```
+
+
+
+# Figure 3
+```{r}
+df_q <- read.csv('data/sampled_articles_qualitative-analysis-articles.csv')
+
+df_q <- df_q %>%
+  mutate(Framing.Populations = na_if(Framing.Populations, "Not mentioned and not implied"))
+df_q$Framing.Populations <- factor(df_q$Framing.Populations, levels = c("Only individual", "Mostly individual", "Both", "Mostly collective", "Only collective"))
+df_q <- df_q %>%
+  mutate(Risk = recode(Risk, "Homocide" = "Homicide", "Alzheimer" = "Alzheimer's",
+        "Traffic" = "Traffic Accidents", "CRD" = "Respiratory Diseases",
+        "OD" = "Overdose", "STD" = "STDs", "Traffic" = "Traffic Accidents",
+        "Flu" = "Influenza", "COVID" = "Pandemics", "Terror" = "Terrorism", 
+        "Heart" = "Heart Disease"))
+
+df_plot <- df_q %>% select(Risk, Framing.Populations) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(as.numeric(Framing.Populations)), 
+            SD = sd(as.numeric(Framing.Populations)), Count = n(),
+            SE = SD / sqrt(Count))
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+df_scatter <- df_q %>% select(Risk, Framing.Populations) %>% drop_na()
+df_scatter$Risk <- factor(df_scatter$Risk, levels = df_plot$Risk)
+df_scatter$Framing.Populations <- as.numeric(df_scatter$Framing.Populations)
+
+a <- ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk, color = Risk)) +
+  geom_point(shape = 21, size = 3) + 
+  geom_errorbar(aes(ymin = Mean - 1.96 * SE, ymax = Mean + 1.96 * SE), width = 0.4, size = 1) + 
+  geom_jitter(data = df_scatter, aes(x = Risk, y = Framing.Populations), size = 0.3, alpha = 0.35, width = 0.2, height = 0.2) + 
+  theme_bw() +
+  labs(title = "Narrative Focus on Individual vs Collective by Risk",
+       x = "", y = "Narrative Focus") + 
+  scale_fill_manual(values = risk_colors) +
+  scale_color_manual(values = risk_colors) +
+  scale_y_continuous(limits = c(1, 5), breaks = 1:5, labels = c("Only individual", "Mostly individual", "Both", "Mostly collective", "Only collective")) + theme(axis.text.x = element_blank())
+
+Frames <- df_plot %>% select(Risk, Mean)
+
+df_q$Sentiment <- as.numeric(gsub("[^0-9-]", "", df_q$Sentiment))
+df_plot <- df_q %>% select(Risk, Sentiment) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Sentiment), SD = sd(Sentiment), Count = n(),
+            SE = SD / sqrt(Count))
+df_plot = df_plot %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+df_scatter <- df_q %>% select(Risk, Sentiment) %>% drop_na()
+df_scatter$Risk <- factor(df_scatter$Risk, levels = df_plot$Risk)
+df_scatter$Sentiment <- as.numeric(df_scatter$Sentiment)
+
+b <- ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk, color = Risk)) +
+  geom_point(shape = 21, size = 3) + 
+  geom_errorbar(aes(ymin = Mean - 1.96 * SE, ymax = Mean + 1.96 * SE), width = 0.4, size = 1) + 
+  geom_jitter(data = df_scatter, aes(x = Risk, y = Sentiment), size = 0.3, alpha = 0.35, 
+              width = 0.2, height = 0.2) + 
+  geom_hline(yintercept = 0, color = "black", size = 0.5) +
+  theme_bw() +
+  labs(title = "GPT-rated article Sentiment by Risk",
+       x = "", y = "GPT-rated Sentiment") + 
+  scale_fill_manual(values = risk_colors) +
+  scale_color_manual(values = risk_colors) +
+  scale_y_continuous(limits = c(-10, 10)) + theme(axis.text.x = element_blank())
+
+Sent <- df_plot %>% select(Risk, Mean)
+
+df_s <- read.csv('data/Sentiment_Articles.csv')
+df_s <- df_s %>%
+  mutate(Risk = recode(Risk, "Homocide" = "Homicide", "Alzheimer" = "Alzheimer's",
+        "Traffic" = "Traffic Accidents", "CRD" = "Respiratory Diseases",
+        "OD" = "Overdose", "STD" = "STDs", "Traffic" = "Traffic Accidents",
+        "Flu" = "Influenza", "COVID" = "Pandemics", "Terror" = "Terrorism", 
+        "Heart" = "Heart Disease")) %>% 
+  select(Risk, Sentiment_Mean, Date, Total_Mentions)
+df_s$Year <- as.numeric(substr(df_s$Date, 1, 4))
+
+# All risks over time
+df_plot <- df_s %>% group_by(Risk, Year) %>%
+  filter(Year < 2020) %>%
+  filter(Year >= 1999) %>%
+  summarize(Mean = mean(Sentiment_Mean, na.rm=T)) %>%
+  mutate(Date = as.Date(paste0(Year, "-01-01"), format = "%Y-%m-%d"))
+
+# Get the overall risk
+df_plot_2 <- df_s %>% group_by(Year) %>%
+  filter(Year < 2020) %>%
+  filter(Year >= 1999) %>%
+  summarize(Mean = mean(Sentiment_Mean, na.rm=T), Risk = "All") %>%
+  mutate(Date = as.Date(paste0(Year, "-01-01"), format = "%Y-%m-%d"))
+
+
+c <- ggplot(df_plot, aes(x = Date, y = Mean, color = Risk)) +
+  geom_line(alpha = 0.7, size = 0.5) + 
+  geom_line(data = df_plot_2, aes(x = Date, y = Mean, color = Risk), alpha=1, color = "black", size = 2.5) +
+  theme_bw() + scale_x_date(date_breaks = "10 years", date_labels = "%b %Y") +
+  labs(title = "Vader Sentiment by Risk Over Time",
+       x = "Date", y = "Vader Sentiment") + 
+  scale_color_manual(values = risk_colors)
+
+ggarrange(a, b, c, ncol = 1, nrow = 3, labels = c("A", "B", "C"))
+ggsave('plots/Focus-Sentiment-Time-Series.png', width = 10, height = 12)
+
+```
+
+
+# Correlations main text
+```{r}
+Slopes$Slope_Adj <- Slopes$log_Deaths_windsor
+df_all <- merge(table_1 %>% select(Risk, ratio), Slopes %>% select(Risk, Slope_Adj), by = "Risk", all = TRUE)
+
+Sent$Sentiment <- Sent$Mean
+df_all <- merge(df_all, Sent %>% select(Risk, Sentiment), by = "Risk", all=T)
+
+Frames$Frame <- Frames$Mean
+df_all <- merge(df_all, Frames %>% select(Risk, Frame), by = "Risk", all=T)
+#Convert columns to numeric
+df_all <- df_all %>% 
+  mutate(Sentiment = as.numeric(Sentiment),
+         ratio = as.numeric(ratio),
+         Frame = as.numeric(Frame),
+         Slope_Adj = as.numeric(Slope_Adj))
+
+cor.test(df_all$Sentiment, df_all$ratio, method='spearman')
+cor.test(df_all$Frame, df_all$ratio, method='spearman')
+
+cor.test(df_all$Sentiment, df_all$Slope_Adj, method='spearman')
+cor.test(df_all$Frame, df_all$Slope_Adj, method='spearman')
+```
+
+
+
+# Appendix items
+
+# Figure S1 - Pandemics and Terrorism
+```{r}
+df_weirdos$Year <- as.numeric(format(df_weirdos$Date, "%Y"))
+df_yearly <- df_weirdos %>% group_by(Year, Risk) %>% 
+  summarise(Deaths = sum(Deaths),
+            media_mentions= sum(media_mentions))
+df_yearly$Deaths = df_yearly$Deaths +1
+
+ggplot(df_yearly, aes(x = Year, group = Risk)) + 
+  geom_line(aes(y = Deaths, color = "Deaths"), alpha=0.8, linewidth=0.5) +
+  geom_line(aes(y = media_mentions * 1, color = "Media Mentions"), alpha=0.8, linewidth=0.5) +
+  scale_y_log10(name = "Deaths",
+                sec.axis = sec_axis(~ . / 1, name = "Media Mentions")) +
+  facet_wrap(~Risk, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(color = "Metric") +  scale_color_manual(values = c("Deaths" = "black", "Media Mentions" = "blue"))
+ggsave('plots/Deaths-Media-Time-Series-Pand-Terror.png',width = 12, height=6)
+```
+
+
+# Figures S2 - S3
+```{r}
+# Can also display annual like this
+df$Year <- as.numeric(format(df$Date, "%Y"))
+df_yearly <- df %>% group_by(Year, Risk) %>% 
+  summarise(log_Deaths = sum(log_Deaths_windsor),
+  log_media_mentions = sum(log_media_mentions_windsor))
+
+
+ggplot(df_yearly, aes(x = Year, color = Risk)) + 
+  geom_line(aes(y = log_Deaths, color = Risk), alpha=0.8, linewidth=0.5) +
+  scale_y_continuous(name = "Log Deaths") +
+  theme_bw() + ggtitle("Log Deaths by Risk") +
+  #scale_x_date(date_breaks = "10 years", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(color = "Risk") + scale_color_manual(values = risk_colors)
+ggsave('plots/FigureS2-Deaths-Time-Series-log.png',width = 12, height=6)
+
+# plot log_media_mentions on one plot
+ggplot(df_yearly, aes(x = Year, color = Risk)) + 
+  geom_line(aes(y = log_media_mentions, color = Risk), alpha=0.8, linewidth=0.5) +
+  scale_y_continuous(name = "Log Media Mentions") +
+  theme_bw() + ggtitle("Log Media Mentions by Risk") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(color = "Risk") + scale_color_manual(values = risk_colors)
+ggsave('plots/FigureS3-Media-Time-Series-log.png',width = 12, height=6)
+
+```
+
+
+
+# Analysis with annual data
+Make nice yearly Df
+```{r}
+# Groupby year
+df$Year <- as.numeric(format(df$Date, "%Y"))
+
+# Only need winsorized data
+df_year <- df %>% group_by(Year, Risk) %>% 
+  summarise(Deaths_windsor = sum(Deaths_windsor),
+  media_mentions_windsor = sum(media_mentions_windsor))
+
+# Calculate log of each
+df_year <- df_year %>% 
+  mutate(log_Deaths_windsor = log(Deaths_windsor),
+         log_media_mentions_windsor = log(media_mentions_windsor))
+
+
+# Difference by each risk
+df_year$dd_Deaths_windsor <- NaN
+df_year$dd_media_mentions_windsor <- NaN
+
+for (r in unique(df_year$Risk)) {
+  df_r <- df_year %>% filter(Risk == r)
+  df_r$dd_Deaths_windsor <- c(NA, diff(df_r$Deaths_windsor))
+  df_year[df_year$Risk == r,]$dd_Deaths_windsor <- df_r$dd_Deaths_windsor
+  df_r$dd_media_mentions_windsor <- c(NA, diff(df_r$media_mentions_windsor))
+  df_year[df_year$Risk == r,]$dd_media_mentions_windsor <- df_r$dd_media_mentions_windsor
+}
+
+df_year$dd_log_Deaths_windsor <- NaN
+df_year$dd_log_media_mentions_windsor <- NaN
+
+for (r in unique(df_year$Risk)) {
+  df_r <- df_year %>% filter(Risk == r)
+  df_r$dd_log_Deaths_windsor <- c(NA, diff(df_r$log_Deaths_windsor))
+  df_year[df_year$Risk == r,]$dd_log_Deaths_windsor <- df_r$dd_log_Deaths_windsor
+  df_r$dd_log_media_mentions_windsor <- c(NA, diff(df_r$log_media_mentions_windsor))
+  df_year[df_year$Risk == r,]$dd_log_media_mentions_windsor <- df_r$dd_log_media_mentions_windsor
+}
+```
+
+
+Yearly Model 1
+```{r}
+model_null1 <- lm(log_media_mentions_windsor ~ log_Deaths_windsor , data = df_year)
+model_null <- lmer(log_media_mentions_windsor ~ log_Deaths_windsor + (1 | Risk), data = df_year)
+anova(model_null, model_null1)
+
+model <- lmer(log_media_mentions_windsor ~ log_Deaths_windsor + (log_Deaths_windsor | Risk), data = df_year)
+anova(model_null, model) # Not significant
+summary(model_null)
+
+```
+
+Yearly Model 2
+```{r}
+# Fails to converge
+model_null <- lmer(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + (1 | Risk), data = df_year)
+model_null <- lmer(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + (dd_log_Deaths_windsor | Risk), data = df_year)
+
+# We look at the OLS model instead:
+model_1 <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor, data = df_year)
+model_2 <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + Risk, data = df_year)
+# Differenced deaths predicts differenced media mentions even controlling for risk!
+
+anova(model_1, model_2) # No difference adding the risk
+summary(model_1)
+```
+
+Yearly Model 3
+```{r}
+risks <- unique(df_year$Risk)
+p_values <- c()
+r_squared_change <- c()
+for (current_risk in risks) {
+  #current_risk <- 'Heart'
+  df_cur <- df_year %>% filter(Risk == current_risk)
+  
+  # Create lagged variables
+  for (i in 1:1) { # Only do 1 because not many years
+    df_cur[[paste0("log_Deaths_windsorlag", i)]] <- c(rep(NA, i), 
+                                    df_cur$log_Deaths_windsor[1:(nrow(df_cur) - i)])
+    df_cur[[paste0("log_media_mentions_windsorlag", i)]] <- c(rep(NA, i),
+                              df_cur$log_media_mentions_windsor[1:(nrow(df_cur) - i)])
+  }
+  
+  base_model <- lm(log_media_mentions_windsor ~ log_Deaths_windsor + log_media_mentions_windsorlag1, data = df_cur %>% drop_na())
+  model <- lm(log_media_mentions_windsor ~ log_Deaths_windsor + log_Deaths_windsorlag1 + log_media_mentions_windsorlag1, data = df_cur %>% drop_na())
+  summary(model)
+  
+  compare <- anova(base_model, model)
+  # Get p-value
+  p_value <- round(compare[2,6],7)
+  p_values <- c(p_values, p_value)
+  
+  no_death_model <- lm(log_media_mentions_windsor ~ log_media_mentions_windsorlag1, 
+                       data = df_cur %>% drop_na())
+  r_square_change <- c(r_square_change, summary(model)$r.squared -
+                         summary(no_death_model)$r.squared)
+  
+}
+df_table <- data.frame(Risk = risks, P_Value = p_values)
+truncatedP(p_values, trunc=1)
+
+# R-squared change
+mean(r_square_change)
+```
+
+
+
+Yearly model 4
+```{r}
+risks <- unique(df$Risk)
+p_values <- c()
+r_squared_change <- c()
+for (current_risk in risks) {
+  #current_risk <- 'Heart'
+  df_cur <- df_year %>% filter(Risk == current_risk)
+  
+  # Create lagged variables
+  for (i in 1:1) { # Only do 1 because not many years
+    df_cur[[paste0("dd_log_Deaths_windsorlag", i)]] <- c(rep(NA, i), 
+                                    df_cur$dd_log_Deaths_windsor[1:(nrow(df_cur) - i)])
+    df_cur[[paste0("dd_log_media_mentions_windsorlag", i)]] <- c(rep(NA, i),
+                              df_cur$dd_log_media_mentions_windsor[1:(nrow(df_cur) - i)])
+  }
+  
+  base_model <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + dd_log_media_mentions_windsorlag1, data = df_cur %>% drop_na())
+  model <- lm(dd_log_media_mentions_windsor ~ dd_log_Deaths_windsor + dd_log_Deaths_windsorlag1 + dd_log_media_mentions_windsorlag1, data = df_cur %>% drop_na())
+  summary(model)
+  
+  compare <- anova(base_model, model)
+  # Get p-value
+  p_value <- round(compare[2,6],7)
+  p_values <- c(p_values, p_value)
+  
+  no_death_model <- lm(dd_log_media_mentions_windsor ~ dd_log_media_mentions_windsorlag1, 
+                       data = df_cur %>% drop_na())
+  r_square_change <- c(r_square_change, summary(model)$r.squared -
+                         summary(no_death_model)$r.squared)
+}
+df_table <- data.frame(Risk = risks, P_Value = p_values)
+truncatedP(p_values, trunc=1)
+
+# R-squared change
+mean(r_square_change)
+```
+
+
+
+# Exogenous Shocks, Terrorism and Pandemics
+```{r}
+df_weirdos$Deaths <- df_weirdos$Deaths + 1
+df_weirdos$log_Deaths <- log(df_weirdos$Deaths)
+
+df_weirdos <- df_weirdos %>% select(Date, Risk, log_media_mentions, log_Deaths)  
+
+
+for (current_risk in c('Pandemics', 'Terrorism')) {
+  df_cur <- df_weirdos %>% filter(Risk == current_risk)
+    
+  
+  df_cur$FMonth <- factor(format(df_cur$Date, "%m"))
+  
+  # Create lagged variables
+  for (i in 1:3) {
+    df_cur[[paste0("log_Deathslag", i)]] <- c(rep(NA, i), 
+                                    df_cur$log_Deaths[1:(nrow(df_cur) - i)])
+    df_cur[[paste0("log_media_mentionslag", i)]] <- c(rep(NA, i),
+                              df_cur$log_media_mentions[1:(nrow(df_cur) - i)])
+  }
+  
+  no_lags_model <- lm(log_media_mentions ~ FMonth, data = df_cur %>% drop_na())
+  
+  no_death_model <- lm(log_media_mentions ~ log_media_mentionslag1 + log_media_mentionslag2 +
+                     log_media_mentionslag3 + FMonth, data = df_cur %>% drop_na())
+  
+  model <- lm(log_media_mentions ~ log_media_mentionslag1 + log_media_mentionslag2 +
+                log_media_mentionslag3 + log_Deaths + log_Deathslag1 + log_Deathslag2 +
+                log_Deathslag3  + FMonth, data = df_cur %>% drop_na())
+  
+  print(paste("Full Model R2:", summary(model)$r.squared))
+  print(paste("No death Model R2:", summary(no_death_model)$r.squared))
+  print(paste("No lags Model R2:", summary(no_lags_model)$r.squared))
+  print(anova(model, no_death_model))
+}
+```
+
+
+# Supplemental Qualitative Analysis
+Focus
+```{r}
+df_q <- df_q %>%
+  mutate(Focus = recode(Focus, "Mentioned once" = "Mentions once")) %>%
+  mutate(Focus = recode(Focus, "Not at all" = "Not relevant",
+                        "Mentions once" = "Hardly at all"))
+
+df_q$Focus <- factor(df_q$Focus, 
+      levels = c("Not relevant", "Hardly at all", "Slightly", "Mostly" , "Entirely"))
+
+df_plot <- df_q %>% select(Risk, Focus) %>% group_by(Risk, Focus) %>%
+  summarize(Count = n())
+
+
+ggplot(df_plot, aes(x = Focus, y = Count, fill = Focus)) +
+  geom_bar(stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~Risk) +
+  labs(title = "Focus of Articles by Risk",
+       x = "Focus", y = "Proportion") + # turn xticks off
+  scale_fill_brewer(palette = "Set1") + theme(axis.text.x = element_blank())
+ggsave('plots/Qual-Focus-by-Risk.png',width = 12, height=10)
+
+table(df_q$Focus)
+146 / 1540
+160 / 1540
+```
+
+Causes
+```{r}
+# Delete all [ ] and "'" in the column
+df_q$Facts.Causes <- gsub("\\[", "", df_q$Facts.Causes)
+df_q$Facts.Causes <- gsub("\\]", "", df_q$Facts.Causes)
+df_q$Facts.Causes <- gsub("'", "", df_q$Facts.Causes)
+
+# Get counts of the following words/phrases for each risk
+# Environmental, Lifestyle, Genetic, Not mentioned and not implied
+df_q$Facts.Causes <- tolower(df_q$Facts.Causes)
+
+df_q$Environmental <- grepl("environmental", df_q$Facts.Causes)
+df_q$Lifestyle <- grepl("lifestyle", df_q$Facts.Causes)
+df_q$Genetic <- grepl("genetic", df_q$Facts.Causes)
+
+# Not mentioned if none of these three mentioned
+df_q$NotMentioned <- !df_q$Environmental & !df_q$Lifestyle & !df_q$Genetic
+
+sum(df_q$NotMentioned) / 1540
+
+# Plot counts of these three for each risk
+df_plot <- df_q %>% select(Risk, Environmental, Lifestyle, Genetic) %>% 
+  gather(key = "Cause", value = "Count", -Risk) %>%
+  group_by(Risk, Cause) %>%
+  summarize(Count = sum(Count))
+
+ggplot(df_plot, aes(x = Cause, y = Count, fill = Cause)) +
+  geom_bar(stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~Risk) +
+  labs(title = "Cause of Risk by Risk",
+       x = "", y = "Count") + 
+  scale_fill_brewer(palette = "Set1") + theme(axis.text.x = element_blank())
+ggsave('plots/Qual-Causes-by-Risk.png',width = 12, height=10)
+
+
+# Create a table with counts of each cause by risk
+df_t <- df_q %>% select(Environmental, Lifestyle, Genetic) %>% 
+  summarize(Count_Environmental = sum(Environmental),
+            Count_Lifestyle = sum(Lifestyle),
+            Count_Genetic = sum(Genetic))  # Make another row that is 1540 - each
+
+df_t <- rbind(df_t, c(1540 - sum(df_t$Count_Environmental), 1540 - sum(df_t$Count_Lifestyle), 1540 - sum(df_t$Count_Genetic)))
+
+chisq.test(df_t)
+```
+
+Mitigation
+```{r}
+df_q$Facts.Mitigation <- gsub("\\[", "", df_q$Facts.Mitigation)
+df_q$Facts.Mitigation <- gsub("\\]", "", df_q$Facts.Mitigation)
+df_q$Facts.Mitigation <- gsub("'", "", df_q$Facts.Mitigation)
+df_q$Facts.Mitigation <- gsub('"', "", df_q$Facts.Mitigation)
+df_q$Facts.Mitigation <- gsub(' ', "", df_q$Facts.Mitigation)
+
+df_q$Facts.Mitigation <- tolower(df_q$Facts.Mitigation)
+
+# Get list of unique items
+x <- unique(df_q$Facts.Mitigation)
+x <- strsplit(x, ",")
+x <- unlist(x)
+
+df_q$Policy <- grepl("policy", df_q$Facts.Mitigation)
+df_q$Community <- grepl("community solutions", df_q$Facts.Mitigation)
+df_q$Innovations_Technology <- grepl("innovations/technology|innovation/technology", df_q$Facts.Mitigation)
+df_q$OtherBehavior <- grepl("otherbehavior", df_q$Facts.Mitigation)
+df_q$Education <- grepl("education", df_q$Facts.Mitigation)
+df_q$Medication <- grepl("medication", df_q$Facts.Mitigation)
+df_q$Exercise <- grepl("exercise", df_q$Facts.Mitigation)
+df_q$MedicalProcedures <- grepl("medicalprocedures", df_q$Facts.Mitigation)
+df_q$Diet <- grepl("diet", df_q$Facts.Mitigation)
+df_q$NotMentionedMit <- !df_q$Policy & !df_q$Community & !df_q$Innovations_Technology & !df_q$OtherBehavior & !df_q$Education & !df_q$Medication & !df_q$Exercise & !df_q$MedicalProcedures & !df_q$Diet
+
+sum(df_q$NotMentionedMit)
+sum(df_q$NotMentionedMit) / 1540
+
+df_plot <- df_q %>% select(Risk, Policy, Community, Innovations_Technology, OtherBehavior, Education, Medication, Exercise, MedicalProcedures, Diet) %>% 
+  gather(key = "Mitigation", value = "Count", -Risk) %>%
+  group_by(Risk, Mitigation) %>%
+  summarize(Count = sum(Count))
+
+
+
+# Make bigger risk categories
+df_q$Behavioral <- df_q$OtherBehavior | df_q$Exercise | df_q$Diet
+df_q$Technological <- df_q$Innovations_Technology | df_q$Medication | df_q$MedicalProcedures
+df_q$PolicySolutions <- df_q$Policy | df_q$Community | df_q$Education
+
+df_plot <- df_q %>% select(Risk, Behavioral, Technological, PolicySolutions) %>% 
+  gather(key = "Mitigation", value = "Count", -Risk) %>%
+  group_by(Risk, Mitigation) %>%
+  summarize(Count = sum(Count))
+
+ggplot(df_plot, aes(x = Mitigation, y = Count, fill = Mitigation)) +
+  geom_bar(stat = "identity") + 
+  theme_bw() +
+  facet_wrap(~Risk) +
+  labs(title = "Mitigation Strategies by Risk",
+       x = "Risk", y = "Proportion") + 
+  scale_fill_brewer(palette = "Set1")+ theme(axis.text.x = element_blank())
+ggsave('plots/Qual-Mitigation-by-Risk-Short.png',width = 12, height=10)
+
+df_t <- df_q %>% select(Behavioral, Technological, PolicySolutions) %>% 
+  summarize(Count_Behavioral = sum(Behavioral),
+            Count_Technological = sum(Technological),
+            Count_PolicySolutions = sum(PolicySolutions))  
+
+df_t <- rbind(df_t, c(1540 - sum(df_t$Count_Behavioral), 1540 - sum(df_t$Count_Technological), 1540 - sum(df_t$Count_PolicySolutions)))
+
+chisq.test(df_t)
+```
+
+
+Framing - Controllable causes
+```{r}
+df_q$Framing.Causes <- as.numeric(gsub("[^0-9]", "", df_q$Framing.Causes))
+
+mean(df_q$Framing.Causes, na.rm=T); sd(df_q$Framing.Causes, na.rm=T)
+
+# Get mean and sd for each risk
+df_plot <- df_q %>% select(Risk, Framing.Causes) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Framing.Causes), SD = sd(Framing.Causes), Count = n())
+
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+# Get all observations
+df_t <- df_q %>% filter(Risk %in% df_plot$Risk) %>% select(Framing.Causes, Risk) %>% drop_na()
+
+# Run a Kruskal Wallis test
+kruskal.test(Framing.Causes ~ Risk, data = df_t)
+```
+
+Framing mitigation
+```{r}
+df_q$Framing.Mitigation <- as.numeric(gsub("[^0-9]", "", df_q$Framing.Mitigation))
+
+mean(df_q$Framing.Mitigation, na.rm=T); sd(df_q$Framing.Mitigation, na.rm=T)
+
+# Get mean and sd for each risk
+df_plot <- df_q %>% select(Risk, Framing.Mitigation) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Framing.Mitigation), SD = sd(Framing.Mitigation), Count = n(),
+            SE = SD / sqrt(Count))
+
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk)) +
+  geom_bar(stat = "identity") + 
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.2) + 
+  theme_bw() +
+  labs(title = "Framing of how effective mitigation is",
+       x = "Risk", y = "Effectiveness of Mitigation") + 
+  scale_fill_manual(values = risk_colors) + theme(axis.text.x = element_blank())
+ggsave('plots/Framing-Mitigation-by-Risk.png',width = 12, height=5)
+
+df_t <- df_q %>% filter(Risk %in% df_plot$Risk) %>% select(Framing.Mitigation, Risk) %>% drop_na()
+
+# Run a Kruskal Wallis test
+kruskal.test(Framing.Mitigation ~ Risk, data = df_t)
+
+```
+
+framing of the solutions
+```{r}
+df_q$Framing.Solutions <- as.numeric(gsub("[^0-9]", "", df_q$Framing.Solutions))
+
+mean(df_q$Framing.Solutions, na.rm=T); sd(df_q$Framing.Solutions, na.rm=T)
+
+# Get mean and sd for each risk
+df_plot <- df_q %>% select(Risk, Framing.Solutions) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Framing.Solutions), SD = sd(Framing.Solutions), Count = n(),
+            SE = SD / sqrt(Count))
+
+# Probably should do 10.
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk)) +
+  geom_bar(stat = "identity") + 
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.2) + 
+  theme_bw() +
+  labs(title = "Solutions are individual vs collective focused",
+       x = "Risk", y = "Individual (low) vs. Collective (high)") + 
+  scale_fill_manual(values = risk_colors) + theme(axis.text.x = element_blank())
+ggsave('plots/Framing-Solutions-by-Risk.png',width = 12, height=5)
+
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_t <- df_q %>% filter(Risk %in% df_plot$Risk) %>% select(Framing.Solutions, Risk) %>% drop_na()
+
+# Run a Kruskal Wallis test
+kruskal.test(Framing.Solutions ~ Risk, data = df_t)
+```
+
+Threat / Sentiment
+```{r}
+# Sentiment
+df_q$Sentiment <- as.numeric(gsub("[^0-9-]", "", df_q$Sentiment))
+
+mean(df_q$Sentiment, na.rm =T); sd(df_q$Sentiment, na.rm =T)
+
+# Plot mean by risk
+df_plot <- df_q %>% select(Risk, Sentiment) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Sentiment), SD = sd(Sentiment), Count = n(),
+            SE = SD / sqrt(Count))
+
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+df_sent <- df_plot
+df_t <- df_q %>% filter(Risk %in% df_plot$Risk) %>% select(Sentiment, Risk) %>% drop_na()
+kruskal.test(Sentiment ~ Risk, data = df_t)
+
+
+# Threat
+df_q$Threat <- as.numeric(gsub("[^0-9-]", "", df_q$Threat))
+
+mean(df_q$Threat, na.rm =T); sd(df_q$Threat, na.rm =T)
+
+# Plot mean by risk
+df_plot <- df_q %>% select(Risk, Threat) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Threat), SD = sd(Threat), Count = n(),
+            SE = SD / sqrt(Count))
+
+df_plot = df_plot %>% filter(Count >= 5) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk)) +
+  geom_bar(stat = "identity") + 
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.2) + 
+  theme_bw() +
+  labs(title = "Threat by Risk",
+       x = "Risk", y = "Threat") + 
+  scale_fill_manual(values = risk_colors) + theme(axis.text.x = element_blank())
+ggsave('plots/Threat-by-Risk.png',width = 12, height=5)
+
+df_t <- df_q %>% filter(Risk %in% df_plot$Risk) %>% select(Threat, Risk) %>% drop_na()
+kruskal.test(Threat ~ Risk, data = df_t)
+
+```
+
+Demographics
+```{r}
+df_q$Facts.Populations <- ifelse(df_q$Demographics != "", df_q$Demographics, df_q$Facts.Populations)
+
+# Standardize these output
+df_q$Facts.Populations <- gsub("\\[", "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub("\\]", "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub("\\{", "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub("\\}", "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub("'", "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub('"', "", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub('=', ":", df_q$Facts.Populations)
+df_q$Facts.Populations <- gsub(' ', "", df_q$Facts.Populations)
+df_q$Facts.Populations <- tolower(df_q$Facts.Populations)
+
+
+# Get list of all demographics used
+extract_words_before_colons <- function(text) {
+  str_extract_all(text, "\\b\\w+(?=:)")[[1]]
+}
+all_words_before_colons <- unique(unlist(lapply(df_q$Facts.Populations, extract_words_before_colons)))
+print(all_words_before_colons)
+
+df_q$Race <- grepl("race|riskpopulationsrace", df_q$Facts.Populations)
+df_q$Gender <- grepl("gender", df_q$Facts.Populations)
+df_q$Age <- grepl("age|demographicsage|riskpopulationsage", df_q$Facts.Populations)
+df_q$SES <- grepl("ses", df_q$Facts.Populations)
+df_q$Region <- grepl("location|region|country|geographicalregion|geographic", df_q$Facts.Populations)
+df_q$SexualOrientation <- grepl("sexualorientation|orientation", df_q$Facts.Populations)
+df_q$Occupation <- grepl("occupation", df_q$Facts.Populations)
+df_q$Religion <- grepl("religion", df_q$Facts.Populations)
+df_q$HealthCondition <- grepl("healthcondition|chromosomalabnormalities|health|healthstatus|medicalhistory|medicalconditions", df_q$Facts.Populations)
+df_q$LegalStatus <- grepl("legalstatus", df_q$Facts.Populations)
+
+# Print counts of each
+print(paste0("Race: ", sum(df_q$Race)))
+print(paste0("Gender: ", sum(df_q$Gender)))
+print(paste0("Age: ", sum(df_q$Age)))
+print(paste0("SES: ", sum(df_q$SES)))
+print(paste0("Region: ", sum(df_q$Region)))
+print(paste0("Sexual Orientation: ", sum(df_q$SexualOrientation)))
+print(paste0("Occupation: ", sum(df_q$Occupation)))
+print(paste0("Religion: ", sum(df_q$Religion)))
+print(paste0("Health Condition: ", sum(df_q$HealthCondition)))
+print(paste0("Legal Status: ", sum(df_q$LegalStatus)))
+print(paste0("Total: ", sum(df_q$Race) + sum(df_q$Gender) + sum(df_q$Age) + sum(df_q$SES) + sum(df_q$Region) + sum(df_q$SexualOrientation) + sum(df_q$Occupation) + sum(df_q$Religion) + sum(df_q$HealthCondition) + sum(df_q$LegalStatus)))
+
+# Now we will find the words after the colon 
+extract_words_after_colons <- function(text) {
+  words <- c()
+  
+  # Get list of all words that immediately follow colons, but before a comma
+  words <- c(words, str_extract_all(df_q$Facts.Populations[7], "(?<=:).*?(?=,)")[[1]])
+  
+  loc <- gregexpr(":", text, fixed=TRUE)[[1]]
+  words <- c(words, substring(text,loc[length(loc)]+1))
+  return(words)
+}
+extract_words_after_colons(df_q$Facts.Populations[7])
+
+# RACE ANALYSIS
+get_race <- function(text) {
+  if (grepl("race|riskpopulationsrace", text)) {
+    return(str_extract_all(text, "(?<=race:).*?(?=,)")[[1]])
+  } else {
+    return("")
+  }
+}
+unique_races <- unique(unlist(lapply(df_q$Facts.Populations, get_race)))
+print(unique_races)
+
+# Get counts of each:
+all_races <- unlist(lapply(df_q$Facts.Populations, get_race))
+counts <- c()
+for (r in unique_races) {
+  m = 0 
+  for (a in all_races) {
+    if (grepl(r, a)) {
+      m = m + 1
+    }
+  }
+  counts <- c(counts, m)
+}
+# For counts of race:
+df_plot <- data.frame(race = unique_races, Counts=counts)
+# Note that you have to add some strange spellings together to get values in the text
+
+df_q %>% select(Race, Risk) %>% group_by(Risk) %>% summarize(Count = sum(Race))
+
+
+
+get_gender <- function(text) {
+  if (grepl("gender", text)) {
+    return(str_extract_all(text, "(?<=gender:).*?(?=,)")[[1]])
+  } else {
+    return("")
+  }
+}
+unique_gender <- unique(unlist(lapply(df_q$Facts.Populations, get_gender)))
+
+all_genders <- unlist(lapply(df_q$Facts.Populations, get_gender))
+counts <- c()
+for (r in unique_gender) {
+  m = 0 
+  for (a in all_genders) {
+    if (grepl(r, a)) {
+      m = m + 1
+    }
+  }
+  counts <- c(counts, m)
+}
+df_plot <- data.frame(race = unique_gender, Counts=counts)
+# To see counts of genders overall
+df_plot
+
+# To see breakdown of genders by risk
+df_q %>% select(Gender, Risk) %>% group_by(Risk) %>% summarize(Count = sum(Gender))
+
+
+# Age analysis
+get_age <- function(text) {
+  if (grepl("age|demographicsage|riskpopulationsage", text)) {
+    return(str_extract_all(text, "(?<=age:).*?(?=,)")[[1]])
+  } else {
+    return("")
+  }
+}
+unique_age <- unique(unlist(lapply(df_q$Facts.Populations, get_age)))
+
+all_age <- unlist(lapply(df_q$Facts.Populations, get_age))
+counts <- c()
+for (r in unique_age) {
+  m = 0 
+  for (a in all_age) {
+    if (grepl(r, a)) {
+      m = m + 1
+    }
+  }
+  counts <- c(counts, m)
+}
+df_plot <- data.frame(age = unique_age, Counts=counts)
+
+df_plot$YoungAdult <- grepl("young-adult|young(victims)|young|teenstoyoung-adult|youngadult|teen|teenagers", df_plot$age)
+sum(df_plot$Counts[df_plot$YoungAdult])
+
+df_plot$Adult <- grepl("adult|middle-age|mid-adult|adults|adultsunder50", df_plot$age)
+sum(df_plot$Counts[df_plot$Adult])
+
+df_plot$Elderly <- grepl("elderly|veryold|older-adult|olderadult|older|olderadults|senior|elder|old", df_plot$age)
+sum(df_plot$Counts[df_plot$Elderly])
+
+df_plot$Child <- grepl("young-child|veryyoung|children|infants|child|young-children|adolescentsandteens", df_plot$age)
+sum(df_plot$Counts[df_plot$Child])
+
+# Breakdown age by risk
+df_q %>% select(Age, Risk) %>% group_by(Risk) %>% summarize(Count = sum(Age))
+
+
+## SES
+df_q %>% select(SES, Risk) %>% group_by(Risk) %>% summarize(Count = sum(SES))
+
+get_ses <- function(text) {
+  if (grepl("ses", text)) {
+    return(str_extract_all(text, "(?<=ses:).*?(?=,)")[[1]])
+  } else {
+    return("")
+  }
+}
+unique_ses <- unique(unlist(lapply(df_q$Facts.Populations, get_ses)))
+
+all_ses <- unlist(lapply(df_q$Facts.Populations, get_ses))
+counts <- c()
+for (r in unique_ses) {
+  m = 0 
+  for (a in all_ses) {
+    if (grepl(r, a)) {
+      m = m + 1
+    }
+  }
+  counts <- c(counts, m)
+}
+df_plot <- data.frame(ses = unique_ses, Counts=counts)
+df_plot
+```
+
+
+
+
+# Supplemental analysis with VADER
+```{r}
+df_s <- read.csv('data/Sentiment_Articles.csv')
+df_s <- df_s %>%
+  mutate(Risk = recode(Risk, "Homocide" = "Homicide", "Alzheimer" = "Alzheimer's",
+        "Traffic" = "Traffic Accidents", "CRD" = "Respiratory Diseases",
+        "OD" = "Overdose", "STD" = "STDs", "Traffic" = "Traffic Accidents",
+        "Flu" = "Influenza", "COVID" = "Pandemics", "Terror" = "Terrorism", 
+        "Heart" = "Heart Disease")) %>% 
+  mutate(Date = as.Date(Date, format = "%Y-%m-%d"),
+         Date = format(Date, "%Y-%m")) 
+df_s$Year <- as.numeric(substr(df_s$Date, 1, 4))
+
+df_plot <- df_s %>% select(Risk, Sentiment_Mean) %>% drop_na() %>% group_by(Risk) %>%
+  summarize(Mean = mean(Sentiment_Mean), SD = sd(Sentiment_Mean), Count = n(),
+            SE = SD / sqrt(Count)) %>% arrange(desc(Mean))
+df_plot$Risk <- factor(df_plot$Risk, levels = df_plot$Risk)
+
+
+ggplot(df_plot, aes(x = Risk, y = Mean, fill = Risk)) +
+  geom_bar(stat = "identity") + 
+  geom_errorbar(aes(ymin = Mean - 1.96 * SE, ymax = Mean + 1.96 * SE), width = 0.4) + 
+  theme_bw() + # Add a horizontal line at 0
+  geom_hline(yintercept = 0, color = "black", size = 0.5) +
+  labs(title = "VADER Sentiment by Risk",
+       x = "Risk", y = "VADER Sentiment") + 
+  scale_fill_manual(values = risk_colors) + theme(axis.text.x = element_blank())
+ggsave('plots/Sentiment-by-Risk.png',width = 12, height=5)
+
+# Correlation on average
+df_plot$Vader <- df_plot$Mean
+df_sent <- merge(df_sent, df_plot %>% select(Risk, Vader), by = "Risk")
+cor.test(df_sent$Mean, df_sent$Vader)
+
+# Correlation on individual plot
+df_t <- merge(df_q %>% select(ResultId, Sentiment), df_s %>% select(ResultId, Sentiment_Mean), by = "ResultId")
+cor.test(df_t$Sentiment, df_t$Sentiment_Mean)
+
+
+# Group by month and Risk
+df_plot <- df_s %>% group_by(Risk, Date) %>%
+  filter(Date < '2021-01') %>%
+  filter(Date >= '1999-01') %>%
+  summarize(Mean = mean(Sentiment_Mean, na.rm=T)) %>%
+  mutate(Date = as.Date(paste0(Date, "-01"), format = "%Y-%m-%d"))
+
+ggplot(df_plot, aes(x = Date, y = Mean, color = Risk)) +
+  geom_line(alpha = 1) + 
+  theme_bw() + scale_x_date(date_breaks = "10 years", date_labels = "%b %Y") +
+  labs(title = "VADER Sentiment by Risk Over Time",
+       x = "Date", y = "Mean Monthly Vader Sentiment") + 
+  scale_color_manual(values = risk_colors) + facet_wrap(~Risk)
+ggsave('plots/Sentiment-Time-Series.png',width = 12, height=10)
+```
+
+q.e.d.

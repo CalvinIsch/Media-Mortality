@@ -1,0 +1,7 @@
+"effect","term","estimate","std.error","statistic","df","p.value"
+"fixed","(Intercept)",0.001,0.003,0.224,3151.49,0.823
+"fixed","dd_log_Deaths_windsor",0.42,0.148,2.831,13.62,0.014
+"ran_pars","sd__(Intercept)",0,NA,NA,NA,NA
+"ran_pars","cor__(Intercept).dd_log_Deaths_windsor",NA,NA,NA,NA,NA
+"ran_pars","sd__dd_log_Deaths_windsor",0.389,NA,NA,NA,NA
+"ran_pars","sd__Observation",0.194,NA,NA,NA,NA
